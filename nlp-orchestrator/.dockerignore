@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.db
+*.db
 .git
 .idea
 .vscode
