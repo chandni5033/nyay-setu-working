@@ -8,6 +8,7 @@ Endpoints:
   POST /api/legal/analyze           — Sync version (testing only)
   GET  /health                      — Health check
 """
+from utils import async_retry
 import asyncio
 import json
 import logging
@@ -19,6 +20,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from cache import (
+    generate_cache_key,
+    get_cached_response,
+    set_cached_response
+)
 from config import FRONTEND_ORIGIN, GROQ_API_KEY, GROQ_MODEL_FAST, GEMINI_API_KEY, GEMINI_MODEL
 from decomposer import decompose_query
 from router import route_questions
@@ -28,6 +34,7 @@ from validators.citation_validator import validate_citations_from_text
 from avatar_speech import get_interim_messages, convert_to_hinglish, detect_domain
 from services.kanoon_search import build_kanoon_context
 from routers.forensics import router as forensics_router
+from routers.modi_ocr import router as modi_ocr_router
 
 # Initialize clients for deep research pipeline
 from groq import AsyncGroq
@@ -64,6 +71,7 @@ app.add_middleware(
 )
 
 app.include_router(forensics_router)
+app.include_router(modi_ocr_router)
 
 
 # ─── Models ───────────────────────────────────────────────────────────────────
@@ -169,10 +177,29 @@ async def legal_reasoning_pipeline(query: str, language: str):
         yield sse_event("done", {"message": "Research complete"})
         logger.info("[Pipeline] Done ✓")
 
+    except (GeneratorExit, asyncio.CancelledError):
+        logger.info("[Pipeline] Client disconnected — cleaning up tasks")
+        raise
+
     except Exception as e:
         logger.error(f"[Pipeline] Fatal error: {e}")
         yield sse_event("error", {"message": str(e)})
         yield sse_event("done", {"message": "Error occurred"})
+
+    finally:
+        if kanoon_task is not None and not kanoon_task.done():
+            kanoon_task.cancel()
+            try:
+                await kanoon_task
+            except (asyncio.CancelledError, BaseException):
+                pass
+
+        if research_task is not None and not research_task.done():
+            research_task.cancel()
+            try:
+                await research_task
+            except (asyncio.CancelledError, BaseException):
+                pass
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -181,6 +208,18 @@ async def legal_reasoning_pipeline(query: str, language: str):
 async def health():
     return {"status": "ok", "service": "nlp-orchestrator", "port": 8001}
 
+@app.get("/models")
+async def get_models():
+    return {
+        "groq": {
+            "model": GROQ_MODEL_FAST,
+            "available": bool(GROQ_API_KEY)
+        },
+        "gemini": {
+            "model": GEMINI_MODEL,
+            "available": bool(GEMINI_API_KEY)
+        }
+    }
 
 @app.post("/api/legal/analyze-stream")
 async def analyze_stream(body: LegalQuery, request: Request):
@@ -270,6 +309,21 @@ Structure your response with:
 5. Important caveats or disclaimers
 
 Format in Markdown. Be precise and cite sources."""
+
+@async_retry(max_attempts=3)
+async def call_groq_with_retry(grounded_prompt, query):
+
+    response = await groq_client.chat.completions.create(
+        model=GROQ_MODEL_FAST,
+        messages=[
+            {"role": "system", "content": grounded_prompt},
+            {"role": "user", "content": query}
+        ],
+        temperature=0.2,
+        max_tokens=2048
+    )
+
+    return response
 
 
 async def deep_research_pipeline(query: str, language: str):
@@ -481,6 +535,10 @@ async def deep_research_pipeline(query: str, language: str):
 
         yield sse_event("done", {"message": "Deep research complete"})
         logger.info("[Deep Research] Pipeline complete ✓")
+
+    except (GeneratorExit, asyncio.CancelledError):
+        logger.info("[Deep Research] Client disconnected")
+        raise
 
     except Exception as e:
         logger.error(f"[Deep Research] Fatal error: {e}")
